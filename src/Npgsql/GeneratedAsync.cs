@@ -1367,32 +1367,59 @@ namespace Npgsql
         }
     }
 
-    partial class ConnectorPool
+    /*partial class ConnectorPool
     {
         internal async Task<NpgsqlConnector> AllocateAsync(NpgsqlConnection conn, NpgsqlTimeout timeout, CancellationToken cancellationToken)
         {
             NpgsqlConnector connector;
-            Monitor.Enter(this);
-            while (Idle.Count > 0)
+
+            foreach (var kvp in Idle)
             {
-                connector = Idle.Pop();
-                // An idle connector could be broken because of a keepalive
-                if (connector.IsBroken)
-                    continue;
-                connector.Connection = conn;
-                Busy++;
-                EnsurePruningTimerState();
-                Monitor.Exit(this);
-                return connector;
+                if (Idle.TryRemove(kvp.Key, out connector))
+                {
+                    // An idle connector could be broken because of a keepalive
+                    if (connector.IsBroken)
+                        continue;
+
+                    connector.ReleaseTimestamp = DateTime.UtcNow;
+                    connector.Connection = conn;
+                    Interlocked.Increment(ref _busyCount);
+
+                    return connector;
+                }
             }
 
-            Contract.Assert(Busy <= _max);
-            if (Busy == _max)
+            bool poolFull = false;
+            SpinWait? spin = null;
+
+            // Try increment busy count
+            while (true)
+            {
+                int busy = Volatile.Read(ref _busyCount);
+                Contract.Assert(busy <= _max);
+
+                if (busy == _max)
+                {
+                    poolFull = true;
+                    break; // Pool full, do not increment busy count
+                }
+
+                int newBusy = busy + 1;
+
+                if (Interlocked.CompareExchange(ref _busyCount, newBusy, busy) == busy)
+                    break; // CAS success
+
+                if (!spin.HasValue)
+                    spin = new SpinWait();
+                spin.Value.SpinOnce();
+            }
+
+            if (poolFull)
             {
                 // TODO: Async cancellation
                 var tcs = new TaskCompletionSource<NpgsqlConnector>();
                 Waiting.Enqueue(tcs);
-                Monitor.Exit(this);
+
                 try
                 {
                     await WaitForTaskAsync(tcs.Task, timeout.TimeLeft, cancellationToken);
@@ -1400,38 +1427,130 @@ namespace Npgsql
                 catch
                 {
                     // We're here if the timeout expired or the cancellation token was triggered
-                    // Re-lock and check in case the task was set to completed after coming out of the Wait
-                    lock (this)
+                    // Check in case the task was set to completed after coming out of the Wait
+                    lock (tcs)
                     {
                         if (!tcs.Task.IsCompleted)
                         {
-                            tcs.SetCanceled();
+                            tcs.TrySetCanceled();
                             throw;
                         }
                     }
                 }
-
                 connector = tcs.Task.Result;
                 connector.Connection = conn;
                 return connector;
             }
 
             // No idle connectors are available, and we're under the pool's maximum capacity.
-            Busy++;
-            Monitor.Exit(this);
             try
             {
-                connector = new NpgsqlConnector(conn)
-                {ClearCounter = _clearCounter};
+                connector = new NpgsqlConnector(conn) { ClearCounter = Volatile.Read(ref _clearCounter) };
                 await connector.OpenAsync(timeout, cancellationToken);
                 EnsureMinPoolSize(conn);
                 return connector;
             }
             catch
             {
-                lock (this)
-                    Busy--;
+                Interlocked.Decrement(ref _busyCount);
                 throw;
+            }
+        }
+    }*/
+
+    partial class ConnectorPool
+    {
+        internal async Task<NpgsqlConnector> AllocateAsync(NpgsqlConnection conn, NpgsqlTimeout timeout, CancellationToken cancellationToken)
+        {
+            NpgsqlConnector connector;
+
+            PoolId poolId;
+            while (IdleIDs.TryPop(out poolId))
+            {
+                string id = Volatile.Read(ref poolId.Id);
+                if (id != null)
+                {
+                    Interlocked.Decrement(ref _idleCount);
+
+                    PoolItem poolItem;
+                    if (Items.TryGetValue(id, out poolItem))
+                    {
+                        connector = Interlocked.Exchange(ref poolItem.Connector, null);
+
+                        if (connector != null)
+                        {
+                            // An idle connector could be broken because of a keepalive
+                            if (!connector.IsBroken)
+                            {
+                                connector.ReleaseTimestamp = DateTime.UtcNow;
+                                connector.Connection = conn;
+
+                                return connector;
+                            }
+                        }
+                    }
+                }
+            }
+
+            bool poolFull = false;
+            SpinWait? spin = null;
+
+            // Try increment item count
+            while (true)
+            {
+                int itemCount = Volatile.Read(ref _itemCount);
+                Contract.Assert(itemCount <= _max);
+
+                if (itemCount == _max)
+                {
+                    poolFull = true;
+                    break; // Pool full, do not increment busy count
+                }
+
+                int newItemCount = itemCount + 1;
+
+                if (Interlocked.CompareExchange(ref _itemCount, newItemCount, itemCount) == itemCount)
+                    break; // CAS success
+
+                if (!spin.HasValue)
+                    spin = new SpinWait();
+                spin.Value.SpinOnce();
+            }
+
+            if (poolFull)
+            {
+                // TODO: Async cancellation
+                var tcs = new TaskCompletionSource<NpgsqlConnector>();
+                Waiting.Enqueue(tcs);
+
+                try
+                {
+                    await WaitForTaskAsync(tcs.Task, timeout.TimeLeft, cancellationToken);
+                }
+                catch
+                {
+                    // We're here if the timeout expired or the cancellation token was triggered
+                    // Check in case the task was set to completed after coming out of the Wait
+                    lock (tcs)
+                    {
+                        if (!tcs.Task.IsCompleted)
+                        {
+                            tcs.TrySetCanceled();
+                            throw;
+                        }
+                    }
+                }
+                connector = tcs.Task.Result;
+                connector.Connection = conn;
+                return connector;
+            }
+            else
+            {
+                // No idle connectors are available, and we're under the pool's maximum capacity.
+                connector = new NpgsqlConnector(conn) { ClearCounter = Volatile.Read(ref _clearCounter) };
+                await connector.OpenAsync(timeout, cancellationToken);
+                EnsureMinPoolSize(conn);
+                return connector;
             }
         }
     }
