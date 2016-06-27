@@ -62,31 +62,17 @@ namespace Npgsql
         }
     }
 
-    internal class PoolItem
-    {
-        public NpgsqlConnector Connector;
-    }
-
-    internal class PoolId
-    {
-        public string Id;
-    }
-
     partial class ConnectorPool
     {
         internal NpgsqlConnectionStringBuilder ConnectionString;
 
-        private readonly ConcurrentDictionary<string, PoolItem> Items = new ConcurrentDictionary<string, PoolItem>();
-
-        private readonly ConcurrentStack<PoolId> IdleIDs = new ConcurrentStack<PoolId>();
+        private readonly ConcurrentDictionary<string, NpgsqlConnector> IdleConnectors = new ConcurrentDictionary<string, NpgsqlConnector>();
 
         private readonly ConcurrentQueue<TaskCompletionSource<NpgsqlConnector>> Waiting = new ConcurrentQueue<TaskCompletionSource<NpgsqlConnector>>();
 
         readonly int _max;
         readonly int _min;
-        //int _busyCount;
         int _idleCount;
-
         int _itemCount;
 
         internal int BusyCount
@@ -127,30 +113,23 @@ namespace Npgsql
         {
             NpgsqlConnector connector;
 
-            PoolId poolId;
-            while (IdleIDs.TryPop(out poolId))
+            foreach (var kvp in IdleConnectors)
             {
-                string id = Volatile.Read(ref poolId.Id);
-                if (id != null)
+                if (IdleConnectors.TryRemove(kvp.Key, out connector))
                 {
-                    PoolItem poolItem;
-                    if (Items.TryGetValue(id, out poolItem))
+                    Interlocked.Decrement(ref _idleCount);
+
+                    // An idle connector could be broken because of a keepalive
+                    if (!connector.IsBroken)
                     {
-                        connector = Interlocked.Exchange(ref poolItem.Connector, null);
+                        connector.ReleaseTimestamp = DateTime.UtcNow;
+                        connector.Connection = conn;
 
-                        if (connector != null)
-                        {
-                            Interlocked.Decrement(ref _idleCount);
-
-                            // An idle connector could be broken because of a keepalive
-                            if (!connector.IsBroken)
-                            {
-                                connector.ReleaseTimestamp = DateTime.UtcNow;
-                                connector.Connection = conn;
-
-                                return connector;
-                            }
-                        }
+                        return connector;
+                    }
+                    else
+                    {
+                        Interlocked.Decrement(ref _itemCount);
                     }
                 }
             }
@@ -167,7 +146,7 @@ namespace Npgsql
                 if (itemCount == _max)
                 {
                     poolFull = true;
-                    break; // Pool full, do not increment busy count
+                    break;
                 }
 
                 int newItemCount = itemCount + 1;
@@ -223,6 +202,8 @@ namespace Npgsql
             // throw it away.
             if (connector.ClearCounter != Volatile.Read(ref _clearCounter))
             {
+                Interlocked.Decrement(ref _itemCount);
+
                 try
                 {
                     connector.Close();
@@ -237,6 +218,7 @@ namespace Npgsql
 
             if (connector.IsBroken)
             {
+                Interlocked.Decrement(ref _itemCount);
                 return;
             }
 
@@ -258,52 +240,23 @@ namespace Npgsql
                     Task.Run(() =>
                     {
                         if (!tcs.TrySetResult(connector))
-                            Release(connector); // Another thread completed the tcs, retry release
+                            Release(connector);
                     });
                     return;
                 }
             }
 
-            EnsurePoolID(connector);
+            if (connector.PoolID == null)
+            {
+                connector.PoolID = Guid.NewGuid().ToString("N");
+            }
+
             connector.ReleaseTimestamp = DateTime.UtcNow;
 
-            Items.AddOrUpdate(connector.PoolID,
-                (id) =>
-                {
-                    return new PoolItem() { Connector = connector };
-                },
-                (id, item) =>
-                {
-                    Interlocked.Exchange(ref item.Connector, connector);
-                    return item;
-                });
+            IdleConnectors.TryAdd(connector.PoolID, connector);
 
-            IdleIDs.Push(new PoolId() { Id = connector.PoolID });
             int idleCount = Interlocked.Increment(ref _idleCount);
-
             Contract.Assert(idleCount <= _max);
-        }
-
-        void EnsurePoolID(NpgsqlConnector connector)
-        {
-            SpinWait? spin = null;
-
-            while (true)
-            {
-                var id = Volatile.Read(ref connector.PoolID);
-
-                if (id != null)
-                    return;
-
-                var newId = Guid.NewGuid().ToString("N");
-
-                if (Interlocked.CompareExchange(ref connector.PoolID, newId, id) == id)
-                    return; // CAS success
-
-                if (!spin.HasValue)
-                    spin = new SpinWait();
-                spin.Value.SpinOnce();
-            }
         }
 
         /// <summary>
@@ -324,10 +277,8 @@ namespace Npgsql
                 {
                     int itemCount = Volatile.Read(ref _itemCount);
 
-                    if (itemCount == _min)
+                    if (itemCount >= _min)
                         return; // Min number of connections available
-
-                    Contract.Assert(itemCount < _min);
 
                     int newItemCount = itemCount + 1;
 
@@ -355,9 +306,8 @@ namespace Npgsql
                     connector.PoolID = Guid.NewGuid().ToString("N");
                     connector.ReleaseTimestamp = DateTime.UtcNow;
 
-                    Items.TryAdd(connector.PoolID, new PoolItem() { Connector = connector });
+                    IdleConnectors.TryAdd(connector.PoolID, connector);
 
-                    IdleIDs.Push(new PoolId() { Id = connector.PoolID });
                     Interlocked.Increment(ref _idleCount);
                 }
                 catch (Exception e)
@@ -370,36 +320,19 @@ namespace Npgsql
 
         internal void PruneIdleConnectors(object state)
         {
-            if (Volatile.Read(ref _idleCount) <= _min)
-                return;
-
             SpinWait? spin = null;
+            int idleLifetime = ConnectionString.ConnectionIdleLifetime;
 
-            var idleLifetime = ConnectionString.ConnectionIdleLifetime;
-            foreach (PoolId poolId in IdleIDs)
+            foreach (var kvp in IdleConnectors)
             {
                 if (Volatile.Read(ref _idleCount) <= _min)
-                    break;
+                    return;
 
-                string id = Volatile.Read(ref poolId.Id);
-                if (id == null)
-                    continue;
-
-                PoolItem poolItem;
-                if (!Items.TryGetValue(id, out poolItem))
-                    continue;
-
-                NpgsqlConnector connector = Volatile.Read(ref poolItem.Connector);
-                if (connector == null)
-                    continue;
+                NpgsqlConnector connector = kvp.Value;
 
                 if ((DateTime.UtcNow - connector.ReleaseTimestamp).TotalSeconds >= idleLifetime)
                 {
-                    id = Interlocked.Exchange(ref poolId.Id, null);
-                    if (id == null)
-                        continue;
-
-                    if (!Items.TryRemove(id, out poolItem))
+                    if (!IdleConnectors.TryRemove(kvp.Key, out connector))
                         continue;
 
                     bool decremented = true;
@@ -430,6 +363,8 @@ namespace Npgsql
 
                     if (decremented)
                     {
+                        Interlocked.Decrement(ref _itemCount);
+
                         try
                         {
                             connector.Close();
@@ -441,9 +376,8 @@ namespace Npgsql
                     }
                     else
                     {
-                        // Put back
-                        Items.TryAdd(id, poolItem);
-                        Interlocked.Exchange(ref poolId.Id, id);
+                        // Put back, we went under min count concurrently
+                        Release(connector);
                     }
                 }
             }
@@ -453,21 +387,17 @@ namespace Npgsql
         {
             List<NpgsqlConnector> idleConnectors = new List<NpgsqlConnector>();
 
-            PoolId poolId;
-            while (IdleIDs.TryPop(out poolId))
+            while (Volatile.Read(ref _idleCount) > 0)
             {
-                string id = Volatile.Read(ref poolId.Id);
-                if (id != null)
-                    Interlocked.Decrement(ref _idleCount);
-            };
-
-            foreach (var kvp in Items)
-            {
-                PoolItem poolItem;
-                if (Items.TryRemove(kvp.Key, out poolItem))
+                foreach (var kvp in IdleConnectors)
                 {
-                    NpgsqlConnector connector = Interlocked.Exchange(ref poolItem.Connector, null);
-                    idleConnectors.Add(connector);
+                    NpgsqlConnector connector;
+                    if (IdleConnectors.TryRemove(kvp.Key, out connector))
+                    {
+                        Interlocked.Decrement(ref _idleCount);
+                        Interlocked.Decrement(ref _itemCount);
+                        idleConnectors.Add(connector);
+                    }
                 }
             }
 

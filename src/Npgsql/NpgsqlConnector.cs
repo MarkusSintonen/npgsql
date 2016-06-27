@@ -203,9 +203,9 @@ namespace Npgsql
         internal DateTime ReleaseTimestamp { get; set; } = DateTime.MaxValue;
 
         /// <summary>
-        /// If pooled, the identifier of the connector inside connection pool
+        /// If pooled, the id of the connector used to identify it inside the pool.
         /// </summary>
-        internal string PoolID;
+        internal string PoolID { get; set; }
 
         internal int ClearCounter { get; set; }
 

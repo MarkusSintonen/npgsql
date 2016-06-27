@@ -1464,30 +1464,23 @@ namespace Npgsql
         {
             NpgsqlConnector connector;
 
-            PoolId poolId;
-            while (IdleIDs.TryPop(out poolId))
+            foreach (var kvp in IdleConnectors)
             {
-                string id = Volatile.Read(ref poolId.Id);
-                if (id != null)
+                if (IdleConnectors.TryRemove(kvp.Key, out connector))
                 {
                     Interlocked.Decrement(ref _idleCount);
 
-                    PoolItem poolItem;
-                    if (Items.TryGetValue(id, out poolItem))
+                    // An idle connector could be broken because of a keepalive
+                    if (!connector.IsBroken)
                     {
-                        connector = Interlocked.Exchange(ref poolItem.Connector, null);
+                        connector.ReleaseTimestamp = DateTime.UtcNow;
+                        connector.Connection = conn;
 
-                        if (connector != null)
-                        {
-                            // An idle connector could be broken because of a keepalive
-                            if (!connector.IsBroken)
-                            {
-                                connector.ReleaseTimestamp = DateTime.UtcNow;
-                                connector.Connection = conn;
-
-                                return connector;
-                            }
-                        }
+                        return connector;
+                    }
+                    else
+                    {
+                        Interlocked.Decrement(ref _itemCount);
                     }
                 }
             }
@@ -1504,7 +1497,7 @@ namespace Npgsql
                 if (itemCount == _max)
                 {
                     poolFull = true;
-                    break; // Pool full, do not increment busy count
+                    break;
                 }
 
                 int newItemCount = itemCount + 1;
